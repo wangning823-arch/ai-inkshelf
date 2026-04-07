@@ -1,0 +1,29 @@
+{
+  "name": "ai-inkshelf",
+  "version": "1.0.0",
+  "description": "Reader-first publishing platform for AI-generated stories.",
+  "main": "src/server.js",
+  "scripts": {
+    "start": "node src/server.js",
+    "dev": "node src/server.js",
+    "demo": "node scripts/demo-flow.js",
+    "pg:init": "node scripts/init-pg.js",
+    "pg:sync": "node scripts/sync-json-to-pg.js",
+    "test": "node --test"
+  },
+  "keywords": [
+    "ai",
+    "publishing",
+    "stories",
+    "express",
+    "open-source"
+  ],
+  "author": "",
+  "license": "Apache-2.0",
+  "type": "commonjs",
+  "dependencies": {
+    "cors": "^2.8.6",
+    "express": "^5.2.1",
+    "pg": "^8.20.0"
+  }
+}

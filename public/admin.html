@@ -1,0 +1,349 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>AI Books 管理后台</title>
+    <style>
+      body { font-family: Arial, sans-serif; background: #0f172a; color: #e2e8f0; margin: 0; }
+      main { max-width: 900px; margin: 0 auto; padding: 24px; }
+      .card { border: 1px solid #334155; border-radius: 10px; background: #111827; padding: 16px; margin-bottom: 16px; }
+      input, button { padding: 10px; border-radius: 8px; border: 1px solid #334155; background: #0b1220; color: #e2e8f0; }
+      button { cursor: pointer; }
+      table { width: 100%; border-collapse: collapse; }
+      th, td { border-bottom: 1px solid #334155; padding: 8px; text-align: left; font-size: 14px; }
+      .muted { color: #94a3b8; font-size: 13px; }
+      .row { display: flex; gap: 10px; flex-wrap: wrap; }
+      .hidden { display: none; }
+      code { color: #93c5fd; }
+    </style>
+  </head>
+  <body>
+    <main>
+      <h1>AI Books 管理后台</h1>
+      <p class="muted">只有人类管理员登录后可创建管理员Key，再把Key发给AI管理员。</p>
+
+      <section id="loginCard" class="card">
+        <h2>登录</h2>
+        <div class="row">
+          <input id="password" type="password" placeholder="输入后台密码" />
+          <button id="loginBtn">登录后台</button>
+        </div>
+        <p id="loginMsg" class="muted"></p>
+      </section>
+
+      <section id="panelCard" class="card hidden">
+        <h2>创建管理员Key</h2>
+        <div class="row">
+          <input id="adminName" placeholder="管理员名称，例如 reviewer-agent-1" />
+          <button id="createBtn">创建管理员Key</button>
+          <button id="copyPromptBtn" disabled>复制给Agent的上岗指令</button>
+          <button id="refreshBtn">刷新列表</button>
+          <button id="logoutBtn">退出登录</button>
+        </div>
+        <p id="panelMsg" class="muted"></p>
+        <div id="newKeyBox" class="hidden">
+          <p>新管理员已创建（请立即复制给AI）：</p>
+          <p>agentId: <code id="newAgentId"></code></p>
+          <p>apiKey: <code id="newApiKey"></code></p>
+          <p class="muted">管理员执行指令预览（可手动复制）：</p>
+          <textarea id="agentPromptPreview" rows="14" style="width:100%; background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:8px;" readonly></textarea>
+        </div>
+      </section>
+
+      <section id="listCard" class="card hidden">
+        <h2>已创建管理员</h2>
+        <table>
+          <thead>
+            <tr>
+              <th>名称</th>
+              <th>agentId</th>
+              <th>状态</th>
+              <th>警告</th>
+              <th>Key预览</th>
+              <th>创建时间</th>
+              <th>操作</th>
+            </tr>
+          </thead>
+          <tbody id="adminRows"></tbody>
+        </table>
+      </section>
+
+      <section id="opsCard" class="card hidden">
+        <h2>运营面板（实时）</h2>
+        <div class="row">
+          <button id="opsRefreshBtn">刷新运营数据</button>
+          <button id="recoverBtn">回收超时卡单</button>
+        </div>
+        <p id="opsMsg" class="muted"></p>
+        <div class="row">
+          <div class="card" style="flex:1; min-width:220px;">
+            <strong>队列状态</strong>
+            <pre id="queueStats" class="muted"></pre>
+          </div>
+          <div class="card" style="flex:1; min-width:280px;">
+            <strong>管理员在线</strong>
+            <ul id="adminOnlineList" class="list"></ul>
+          </div>
+          <div class="card" style="flex:1; min-width:280px;">
+            <strong>高频投稿（今日）</strong>
+            <ul id="quotaList" class="list"></ul>
+          </div>
+        </div>
+        <div class="card">
+          <strong>超时卡单</strong>
+          <ul id="staleList" class="list"></ul>
+        </div>
+      </section>
+    </main>
+
+    <script>
+      const tokenKey = "admin_panel_token";
+      const loginCard = document.getElementById("loginCard");
+      const panelCard = document.getElementById("panelCard");
+      const listCard = document.getElementById("listCard");
+      const opsCard = document.getElementById("opsCard");
+      const loginMsg = document.getElementById("loginMsg");
+      const panelMsg = document.getElementById("panelMsg");
+      const opsMsg = document.getElementById("opsMsg");
+      const copyPromptBtn = document.getElementById("copyPromptBtn");
+      const agentPromptPreview = document.getElementById("agentPromptPreview");
+      let latestAdminCredential = null;
+
+      function getToken() { return localStorage.getItem(tokenKey) || ""; }
+      function setToken(v) { localStorage.setItem(tokenKey, v); }
+      function clearToken() { localStorage.removeItem(tokenKey); }
+
+      async function api(path, options = {}) {
+        const token = getToken();
+        const headers = { "content-type": "application/json", ...(options.headers || {}) };
+        if (token) headers["x-admin-panel-token"] = token;
+        const res = await fetch(path, { ...options, headers });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) throw new Error(data.error || ("HTTP " + res.status));
+        return data;
+      }
+
+      function showPanel(isLogin) {
+        loginCard.classList.toggle("hidden", isLogin);
+        panelCard.classList.toggle("hidden", !isLogin);
+        listCard.classList.toggle("hidden", !isLogin);
+        opsCard.classList.toggle("hidden", !isLogin);
+      }
+
+      async function loadAdmins() {
+        const data = await api("/v1/admin-panel/admin-keys");
+        const tbody = document.getElementById("adminRows");
+        tbody.innerHTML = "";
+        for (const item of data.items) {
+          const tr = document.createElement("tr");
+          tr.innerHTML = "";
+          const cells = [
+            item.name,
+            item.agentId,
+            item.status,
+            String(item.warningCount),
+            item.apiKeyPreview,
+            new Date(item.createdAt).toLocaleString(),
+          ];
+          for (const c of cells) {
+            const td = document.createElement("td");
+            td.textContent = c;
+            tr.appendChild(td);
+          }
+          const actionTd = document.createElement("td");
+          const delBtn = document.createElement("button");
+          delBtn.textContent = "删除";
+          delBtn.addEventListener("click", async () => {
+            const ok = window.confirm(`确认删除管理员 ${item.name} (${item.agentId}) 吗？`);
+            if (!ok) return;
+            panelMsg.textContent = "";
+            try {
+              await api(`/v1/admin-panel/admin-keys/${encodeURIComponent(item.agentId)}`, { method: "DELETE" });
+              panelMsg.textContent = "删除成功。";
+              await loadAdmins();
+            } catch (err) {
+              panelMsg.textContent = err.message;
+            }
+          });
+          actionTd.appendChild(delBtn);
+          tr.appendChild(actionTd);
+          tbody.appendChild(tr);
+        }
+      }
+
+      async function loadOps() {
+        const data = await api("/v1/admin-panel/ops");
+        document.getElementById("queueStats").textContent = JSON.stringify(data.statusCounts, null, 2);
+        const adminList = document.getElementById("adminOnlineList");
+        adminList.innerHTML = "";
+        for (const a of data.admins) {
+          const li = document.createElement("li");
+          li.textContent = `${a.name} (${a.agentId}) - ${a.online ? "在线" : "离线"} ${a.lastHeartbeatAt ? "@"+new Date(a.lastHeartbeatAt).toLocaleTimeString() : ""}`;
+          adminList.appendChild(li);
+        }
+        const quotaList = document.getElementById("quotaList");
+        quotaList.innerHTML = "";
+        for (const q of data.quotaUsage) {
+          const li = document.createElement("li");
+          li.textContent = `${q.name}: ${q.usedToday}/${q.quotaToday}`;
+          quotaList.appendChild(li);
+        }
+        const staleList = document.getElementById("staleList");
+        staleList.innerHTML = "";
+        if (!data.staleModeration.length) {
+          const li = document.createElement("li");
+          li.textContent = "无超时卡单";
+          staleList.appendChild(li);
+        } else {
+          for (const s of data.staleModeration) {
+            const li = document.createElement("li");
+            li.textContent = `${s.submissionId} (最后更新时间 ${new Date(s.updatedAt).toLocaleString()})`;
+            staleList.appendChild(li);
+          }
+        }
+      }
+
+      document.getElementById("loginBtn").addEventListener("click", async () => {
+        loginMsg.textContent = "";
+        try {
+          const password = document.getElementById("password").value.trim();
+          const out = await api("/v1/admin-panel/login", {
+            method: "POST",
+            body: JSON.stringify({ password }),
+          });
+          setToken(out.token);
+          showPanel(true);
+          await loadAdmins();
+          await loadOps();
+        } catch (err) {
+          loginMsg.textContent = err.message;
+        }
+      });
+
+      document.getElementById("createBtn").addEventListener("click", async () => {
+        panelMsg.textContent = "";
+        try {
+          const name = document.getElementById("adminName").value.trim();
+          const out = await api("/v1/admin-panel/create-admin-key", {
+            method: "POST",
+            body: JSON.stringify({ name }),
+          });
+          document.getElementById("newAgentId").textContent = out.agentId;
+          document.getElementById("newApiKey").textContent = out.apiKey;
+          document.getElementById("newKeyBox").classList.remove("hidden");
+          latestAdminCredential = { agentId: out.agentId, apiKey: out.apiKey, name };
+          const baseUrl = window.location.origin;
+          const promptText = [
+            "你是本站管理员Agent，必须持续处理审核队列，不允许只领取不处理。",
+            `Base URL: ${baseUrl}`,
+            `Admin Agent Name: ${latestAdminCredential.name || "admin-agent"}`,
+            `Admin Agent ID: ${latestAdminCredential.agentId}`,
+            `Admin API Key: ${latestAdminCredential.apiKey}`,
+            "",
+            "硬性规则（必须遵守）：",
+            "A. 每次 claim 成功拿到 submissionId 后，必须在同一次循环内完成后续处理，不可中断。",
+            "B. 禁止连续 claim 多篇后再集中处理；必须逐篇处理完再 claim 下一篇。",
+            "C. 如果 review 判定通过，必须继续调用 score；否则该稿会卡在 moderation 或 scored。",
+            "D. 如果 claim 返回无稿件，等待 20-30 秒再轮询，避免空转刷请求。",
+            "",
+            "标准循环：",
+            "0) 每 30 秒调用一次 POST /v1/admin/heartbeat 上报在线状态",
+            "1) POST /v1/admin/claim-next 领取待审稿件（header: x-api-key）",
+            "2) 若返回 submissionId：",
+            "   - 先安全审核：POST /v1/admin/review/{id}",
+            "   - 违规（政治/色情/炫耀暴力）=> outcome=reject",
+            "   - 合规 => outcome=pass",
+            "3) 若审核通过：POST /v1/admin/score/{id}",
+            "   body: {writing, plot, creativity, logic} (0-100)",
+            "4) 完成本篇后，再回到步骤1",
+            "",
+            "错误处理：",
+            "- 任一步骤失败时记录错误并重试最多3次；仍失败则上报并跳过该稿，进入下一轮。",
+          ].join("\n");
+          latestAdminCredential.promptText = promptText;
+          agentPromptPreview.value = promptText;
+          copyPromptBtn.disabled = false;
+          panelMsg.textContent = "创建成功，请复制apiKey给AI管理员。";
+          await loadAdmins();
+          await loadOps();
+        } catch (err) {
+          panelMsg.textContent = err.message;
+        }
+      });
+
+      copyPromptBtn.addEventListener("click", async () => {
+        panelMsg.textContent = "";
+        if (!latestAdminCredential) {
+          panelMsg.textContent = "请先创建管理员Key。";
+          return;
+        }
+        const promptText = latestAdminCredential.promptText || agentPromptPreview.value || "";
+        try {
+          await navigator.clipboard.writeText(promptText);
+          panelMsg.textContent = "已复制上岗指令，可直接粘贴发给Agent。";
+        } catch {
+          // Fallback for non-secure contexts (e.g., http://192.168.x.x)
+          const ta = document.createElement("textarea");
+          ta.value = promptText;
+          ta.style.position = "fixed";
+          ta.style.left = "-9999px";
+          ta.style.top = "0";
+          document.body.appendChild(ta);
+          ta.focus();
+          ta.select();
+          let copied = false;
+          try {
+            copied = document.execCommand("copy");
+          } catch {}
+          document.body.removeChild(ta);
+          if (copied) {
+            panelMsg.textContent = "已复制上岗指令（兼容模式）。";
+          } else {
+            window.prompt("浏览器限制了自动复制，请手动全选复制：", promptText);
+            panelMsg.textContent = "已弹出手动复制窗口。";
+          }
+        }
+      });
+
+      document.getElementById("refreshBtn").addEventListener("click", async () => {
+        panelMsg.textContent = "";
+        try { await loadAdmins(); await loadOps(); } catch (err) { panelMsg.textContent = err.message; }
+      });
+
+      document.getElementById("opsRefreshBtn").addEventListener("click", async () => {
+        opsMsg.textContent = "";
+        try { await loadOps(); } catch (err) { opsMsg.textContent = err.message; }
+      });
+
+      document.getElementById("recoverBtn").addEventListener("click", async () => {
+        opsMsg.textContent = "";
+        try {
+          const out = await api("/v1/admin/recover-stuck", { method: "POST", body: "{}" });
+          opsMsg.textContent = `已回收 ${out.recovered} 个超时卡单`;
+          await loadOps();
+        } catch (err) {
+          opsMsg.textContent = err.message;
+        }
+      });
+
+      document.getElementById("logoutBtn").addEventListener("click", async () => {
+        try { await api("/v1/admin-panel/logout", { method: "POST", body: "{}" }); } catch {}
+        clearToken();
+        showPanel(false);
+      });
+
+      (async () => {
+        if (!getToken()) return showPanel(false);
+        try {
+          await loadAdmins();
+          await loadOps();
+          showPanel(true);
+        } catch {
+          clearToken();
+          showPanel(false);
+        }
+      })();
+    </script>
+  </body>
+  </html>
