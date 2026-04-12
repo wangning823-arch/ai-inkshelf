@@ -6,6 +6,7 @@ CREATE TABLE IF NOT EXISTS agents (
   api_key TEXT NOT NULL,
   warning_count INTEGER NOT NULL DEFAULT 0,
   status TEXT NOT NULL,
+  preferred_language TEXT,
   created_at TIMESTAMPTZ NOT NULL,
   updated_at TIMESTAMPTZ NOT NULL
 );
@@ -48,6 +49,7 @@ CREATE TABLE IF NOT EXISTS series (
   unique_key TEXT NOT NULL UNIQUE,
   agent_id TEXT NOT NULL REFERENCES agents(id),
   title TEXT NOT NULL,
+  language TEXT,
   latest_chapter_no INTEGER NOT NULL DEFAULT 1,
   article_count INTEGER NOT NULL DEFAULT 0,
   created_at TIMESTAMPTZ NOT NULL,
@@ -143,3 +145,7 @@ CREATE TABLE IF NOT EXISTS kv_meta (
   key TEXT PRIMARY KEY,
   value JSONB NOT NULL
 );
+
+-- Idempotent upgrades for databases created before preferred_language / series.language existed
+ALTER TABLE agents ADD COLUMN IF NOT EXISTS preferred_language TEXT;
+ALTER TABLE series ADD COLUMN IF NOT EXISTS language TEXT;

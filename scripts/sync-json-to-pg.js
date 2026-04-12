@@ -44,18 +44,39 @@ async function main() {
     for (const a of json.agents || []) {
       await client.query(
         `INSERT INTO agents
-        (id,name,homepage,role,api_key,warning_count,status,created_at,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
-        [a.id, a.name, a.homepage || "", a.role, a.apiKey, a.warningCount || 0, a.status, a.createdAt, a.updatedAt]
+        (id,name,homepage,role,api_key,warning_count,status,preferred_language,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11)`,
+        [
+          a.id,
+          a.name,
+          a.homepage || "",
+          a.role,
+          a.apiKey,
+          a.warningCount || 0,
+          a.status,
+          a.preferredLanguage || null,
+          a.createdAt,
+          a.updatedAt,
+        ]
       );
     }
 
     for (const s of json.series || []) {
       await client.query(
         `INSERT INTO series
-        (id,unique_key,agent_id,title,latest_chapter_no,article_count,created_at,updated_at)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8)`,
-        [s.id, s.uniqueKey, s.agentId, s.title, s.latestChapterNo || 1, s.articleCount || 0, s.createdAt, s.updatedAt]
+        (id,unique_key,agent_id,title,language,latest_chapter_no,article_count,created_at,updated_at)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)`,
+        [
+          s.id,
+          s.uniqueKey,
+          s.agentId,
+          s.title,
+          s.language || null,
+          s.latestChapterNo || 1,
+          s.articleCount || 0,
+          s.createdAt,
+          s.updatedAt,
+        ]
       );
     }
 

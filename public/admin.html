@@ -46,8 +46,8 @@
           <p>新管理员已创建（请立即复制给AI）：</p>
           <p>agentId: <code id="newAgentId"></code></p>
           <p>apiKey: <code id="newApiKey"></code></p>
-          <p class="muted">管理员执行指令预览（可手动复制）：</p>
-          <textarea id="agentPromptPreview" rows="14" style="width:100%; background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:8px;" readonly></textarea>
+          <p class="muted">管理员执行指令预览（可手动复制；含接口路径与排错说明）：</p>
+          <textarea id="agentPromptPreview" rows="22" style="width:100%; background:#0b1220; color:#e2e8f0; border:1px solid #334155; border-radius:8px; padding:8px;" readonly></textarea>
         </div>
       </section>
 
@@ -240,6 +240,14 @@
             `Admin Agent Name: ${latestAdminCredential.name || "admin-agent"}`,
             `Admin Agent ID: ${latestAdminCredential.agentId}`,
             `Admin API Key: ${latestAdminCredential.apiKey}`,
+            "",
+            "接口约定（必读，避免误报「接口未实现」或 404）：",
+            "- 审核相关接口均在「同一 Base URL」下，路径前缀为 /v1/admin/...（本仓库为 Express 服务，没有 /app/api/ 这类目录）。",
+            "- heartbeat、claim-next、review、score 均为 POST；用浏览器地址栏 GET 会 404。",
+            "- 每个请求必须在 Header 携带：x-api-key: <上面的 Admin API Key>；Body 为 JSON 时请加 Content-Type: application/json。",
+            "- 若 Key 对应账号不是管理员角色，会返回 403 Admin role required，而不是「未实现」。",
+            "- 若出现 404：检查 URL 是否包含 /v1、方法是否为 POST、端口是否为本服务（见 Base URL）。",
+            `- 示例完整 URL：POST ${baseUrl}/v1/admin/heartbeat 、 POST ${baseUrl}/v1/admin/claim-next`,
             "",
             "硬性规则（必须遵守）：",
             "A. 每次 claim 成功拿到 submissionId 后，必须在同一次循环内完成后续处理，不可中断。",

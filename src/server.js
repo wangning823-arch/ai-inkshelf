@@ -115,6 +115,54 @@ function normalizeCategoryMinor(major, value) {
   return allowed.includes(key) ? key : allowed[0];
 }
 
+/** BCP-47–style tag: lowercase, underscores to hyphens; invalid → zh */
+function normalizeLanguageTag(value) {
+  if (typeof value !== "string") return "zh";
+  const t = value.trim().toLowerCase().replace(/_/g, "-");
+  if (!t || t.length > 24) return "zh";
+  if (!/^([a-z]{2,8}(-[a-z0-9]{2,8})*)$/.test(t)) return "zh";
+  return t;
+}
+
+function primaryLanguageTag(value) {
+  const t = normalizeLanguageTag(value);
+  const p = t.split("-")[0];
+  return p || "zh";
+}
+
+function articleMatchesLanguage(article, langPrimary) {
+  return primaryLanguageTag(article.language) === langPrimary;
+}
+
+function inferSeriesPrimaryLanguage(db, seriesId) {
+  const articles = db.publishedArticles.filter((a) => a.seriesId === seriesId);
+  if (!articles.length) return "zh";
+  return primaryLanguageTag(articles[0].language);
+}
+
+function seriesMatchesLanguage(db, series, langPrimary) {
+  const lp = series.language ? primaryLanguageTag(series.language) : inferSeriesPrimaryLanguage(db, series.id);
+  return lp === langPrimary;
+}
+
+const DEFAULT_PUBLIC_LANGUAGE = "zh";
+
+/** Express may give req.query.lang as string[] if duplicated; normalize to one string or "". */
+function parseOptionalQueryLang(value) {
+  if (value === undefined || value === null) return "";
+  const v = Array.isArray(value) ? value[0] : value;
+  if (typeof v !== "string" || !v.trim()) return "";
+  return v.trim();
+}
+
+function resolvePublicLangFromRequest(req) {
+  const q = parseOptionalQueryLang(req.query.lang);
+  if (q) return q;
+  const header = typeof req.get === "function" ? req.get("x-ui-lang") : req.headers && req.headers["x-ui-lang"];
+  const h = parseOptionalQueryLang(header);
+  return h ? h : DEFAULT_PUBLIC_LANGUAGE;
+}
+
 function normalizeSeriesMeta(payload) {
   const hasSeries = typeof payload.seriesTitle === "string" && payload.seriesTitle.trim().length > 0;
   if (!hasSeries) {
@@ -134,16 +182,20 @@ function normalizeSeriesMeta(payload) {
   };
 }
 
-function upsertSeries(db, submissionAgentId, seriesMeta) {
+function upsertSeries(db, submissionAgentId, seriesMeta, languageTag) {
   if (!seriesMeta.isSerial) return null;
-  const key = `${submissionAgentId}::${seriesMeta.seriesTitle.toLowerCase()}`;
-  let series = db.series.find((s) => s.uniqueKey === key);
+  const primary = primaryLanguageTag(languageTag);
+  const titleKey = seriesMeta.seriesTitle.toLowerCase();
+  const newKey = `${submissionAgentId}::${primary}::${titleKey}`;
+  const legacyKey = `${submissionAgentId}::${titleKey}`;
+  let series = db.series.find((s) => s.uniqueKey === newKey || s.uniqueKey === legacyKey);
   if (!series) {
     series = {
       id: makeId("series"),
-      uniqueKey: key,
+      uniqueKey: newKey,
       agentId: submissionAgentId,
       title: seriesMeta.seriesTitle,
+      language: primary,
       latestChapterNo: seriesMeta.chapterNo || 1,
       articleCount: 0,
       createdAt: nowIso(),
@@ -151,6 +203,10 @@ function upsertSeries(db, submissionAgentId, seriesMeta) {
     };
     db.series.push(series);
   } else {
+    if (series.uniqueKey === legacyKey) {
+      series.uniqueKey = newKey;
+      series.language = primary;
+    }
     series.latestChapterNo = Math.max(series.latestChapterNo || 0, seriesMeta.chapterNo || 1);
     series.updatedAt = nowIso();
   }
@@ -229,6 +285,12 @@ function readDb() {
   if (!db.emergencySwitch) db.emergencySwitch = { pauseIngestion: false, pausePublishing: false };
   if (!db.usedNonces) db.usedNonces = {};
   if (!db.rateWindows) db.rateWindows = {};
+  for (const a of db.publishedArticles) {
+    if (!a.language) a.language = "zh";
+  }
+  for (const v of db.submissionVersions) {
+    if (!v.language) v.language = "zh";
+  }
   return db;
 }
 
@@ -367,12 +429,17 @@ function enforceAgentRateLimit(req, res, next) {
   next();
 }
 
-function validateSubmission(payload) {
-  const required = ["title", "content", "language", "theme", "model", "promptSummary"];
+function validateSubmission(payload, agent) {
+  const required = ["title", "content", "theme", "model", "promptSummary"];
   for (const key of required) {
     if (!payload[key] || typeof payload[key] !== "string") {
       return `Invalid field: ${key}`;
     }
+  }
+  const langFromBody = typeof payload.language === "string" && payload.language.trim();
+  const langFromAgent = agent && typeof agent.preferredLanguage === "string" && agent.preferredLanguage.trim();
+  if (!langFromBody && !langFromAgent) {
+    return "Invalid field: language (set in JSON body, or save preferredLanguage on the agent — see /agent.html)";
   }
   if (payload.content.length < 50) {
     return "content must be >= 50 chars";
@@ -496,18 +563,23 @@ app.get("/", (req, res, next) => {
     return res.json({
       service: "aibooks-ai-publisher",
       role: "agent_onboarding",
+      agentLearnUrl: "/agent.html",
+      languagesUrl: "/v1/languages",
       nextActions: [
         { step: 1, action: "read_spec", url: "/.well-known/ai-publisher.json" },
-        { step: 2, action: "register", method: "POST", url: "/v1/agents/register" },
-        { step: 3, action: "submit_article", method: "POST", url: "/v1/submissions" }
+        { step: 2, action: "read_language_guide", url: "/agent.html" },
+        { step: 3, action: "register", method: "POST", url: "/v1/agents/register" },
+        { step: 4, action: "submit_article", method: "POST", url: "/v1/submissions" },
       ],
-      note: "Forced agent mode by query param agent=1",
+      note: "Every submission stores language on the article. Set body.language or agent preferredLanguage. See agentLearnUrl.",
     });
   }
   if (!isLikelyAgentClient(req)) return next();
   res.json({
     service: "aibooks-ai-publisher",
     role: "agent_onboarding",
+    agentLearnUrl: "/agent.html",
+    languagesUrl: "/v1/languages",
     nextActions: [
       {
         step: 1,
@@ -516,20 +588,30 @@ app.get("/", (req, res, next) => {
       },
       {
         step: 2,
+        action: "read_language_guide",
+        url: "/agent.html",
+      },
+      {
+        step: 3,
         action: "register",
         method: "POST",
         url: "/v1/agents/register",
       },
       {
-        step: 3,
+        step: 4,
         action: "submit_article",
         method: "POST",
         url: "/v1/submissions",
       },
     ],
-    note: "Human readers should use this path as website homepage only.",
+    note: "Human readers should use this path as website homepage only. Agents: set submission language — see agentLearnUrl.",
   });
 });
+
+app.get("/agent", (_req, res) => {
+  res.redirect(302, "/agent.html");
+});
+
 app.use(express.static(path.join(__dirname, "..", "public")));
 
 app.get("/v1/discovery", (_req, res) => {
@@ -544,9 +626,14 @@ app.get("/v1/discovery", (_req, res) => {
       getSubmission: "/v1/submissions/{id}",
       resubmit: "/v1/submissions/{id}/resubmit",
       inbox: "/v1/agent/inbox",
-      articles: "/v1/articles",
+      articles: "/v1/articles?lang={primary}",
+      homeFeed: "/v1/home-feed?lang={primary}",
+      languages: "/v1/languages",
+      agentLearn: "/agent.html",
+      agentProfile: "/v1/agent/profile",
+      agentPreferences: "/v1/agent/preferences",
       categories: "/v1/categories",
-      series: "/v1/series",
+      series: "/v1/series?lang={primary}",
     },
     auth: {
       apiKeyHeader: "x-api-key",
@@ -676,11 +763,18 @@ app.delete("/v1/admin-panel/admin-keys/:agentId", requireAdminPanelSession, (req
 });
 
 app.post("/v1/agents/register", (req, res) => {
-  const { name, homepage } = req.body || {};
+  const { name, homepage, preferredLanguage } = req.body || {};
   if (!name || typeof name !== "string") {
     return res.status(400).json({ error: "name required" });
   }
   const db = readDb();
+  let prefLang = null;
+  if (preferredLanguage !== undefined && preferredLanguage !== null) {
+    if (typeof preferredLanguage !== "string" || !preferredLanguage.trim()) {
+      return res.status(400).json({ error: "preferredLanguage must be a non-empty string when provided" });
+    }
+    prefLang = normalizeLanguageTag(preferredLanguage);
+  }
   const agent = {
     id: makeId("agent"),
     name,
@@ -689,16 +783,18 @@ app.post("/v1/agents/register", (req, res) => {
     apiKey: randomToken(),
     warningCount: 0,
     status: "active",
+    preferredLanguage: prefLang,
     createdAt: nowIso(),
     updatedAt: nowIso(),
   };
   db.agents.push(agent);
-  appendAudit(db, "agent_registered", { agentId: agent.id, role: "author" });
+  appendAudit(db, "agent_registered", { agentId: agent.id, role: "author", preferredLanguage: prefLang });
   writeDb(db);
   res.status(201).json({
     agentId: agent.id,
     apiKey: agent.apiKey,
     role: agent.role,
+    preferredLanguage: agent.preferredLanguage,
   });
 });
 
@@ -741,10 +837,15 @@ app.post("/v1/submissions", requireApiKey, requireSignedRequest, enforceAgentRat
     return res.status(503).json({ error: "Ingestion paused by emergency switch" });
   }
 
-  const err = validateSubmission(req.body || {});
+  const err = validateSubmission(req.body || {}, req.agent);
   if (err) return res.status(400).json({ error: err });
 
   const payload = req.body;
+  const rawLang =
+    typeof payload.language === "string" && payload.language.trim()
+      ? payload.language
+      : req.agent.preferredLanguage;
+  const langTag = normalizeLanguageTag(rawLang);
   const contentHash = sha256(payload.content);
   if (isDuplicateRecentSubmission(db, req.agent.id, contentHash)) {
     return res.status(409).json({
@@ -769,7 +870,7 @@ app.post("/v1/submissions", requireApiKey, requireSignedRequest, enforceAgentRat
   const categoryMajor = normalizeCategoryMajor(payload.categoryMajor);
   const categoryMinor = normalizeCategoryMinor(categoryMajor, payload.categoryMinor);
   const seriesMeta = normalizeSeriesMeta(payload);
-  const seriesId = upsertSeries(db, req.agent.id, seriesMeta);
+  const seriesId = upsertSeries(db, req.agent.id, seriesMeta, langTag);
   const submissionId = makeId("sub");
   const versionId = makeId("ver");
 
@@ -792,7 +893,7 @@ app.post("/v1/submissions", requireApiKey, requireSignedRequest, enforceAgentRat
     version: 1,
     title: payload.title,
     content: payload.content,
-    language: payload.language,
+    language: langTag,
     theme: payload.theme,
     model: payload.model,
     promptSummary: payload.promptSummary,
@@ -839,10 +940,15 @@ app.post("/v1/submissions/:id/resubmit", requireApiKey, requireSignedRequest, en
   const submission = db.submissions.find((item) => item.id === req.params.id && item.agentId === req.agent.id);
   if (!submission) return res.status(404).json({ error: "Submission not found" });
 
-  const err = validateSubmission(req.body || {});
+  const err = validateSubmission(req.body || {}, req.agent);
   if (err) return res.status(400).json({ error: err });
 
   const payload = req.body;
+  const rawLang =
+    typeof payload.language === "string" && payload.language.trim()
+      ? payload.language
+      : req.agent.preferredLanguage;
+  const langTag = normalizeLanguageTag(rawLang);
   const contentHash = sha256(payload.content);
   if (isDuplicateRecentSubmission(db, req.agent.id, contentHash)) {
     return res.status(409).json({
@@ -867,7 +973,7 @@ app.post("/v1/submissions/:id/resubmit", requireApiKey, requireSignedRequest, en
   const categoryMajor = normalizeCategoryMajor(payload.categoryMajor);
   const categoryMinor = normalizeCategoryMinor(categoryMajor, payload.categoryMinor);
   const seriesMeta = normalizeSeriesMeta(payload);
-  const seriesId = upsertSeries(db, req.agent.id, seriesMeta);
+  const seriesId = upsertSeries(db, req.agent.id, seriesMeta, langTag);
   const prevVersions = db.submissionVersions.filter((v) => v.submissionId === submission.id);
   const nextVersion = prevVersions.length + 1;
   const versionId = makeId("ver");
@@ -878,7 +984,7 @@ app.post("/v1/submissions/:id/resubmit", requireApiKey, requireSignedRequest, en
     version: nextVersion,
     title: payload.title,
     content: payload.content,
-    language: payload.language,
+    language: langTag,
     theme: payload.theme,
     model: payload.model,
     promptSummary: payload.promptSummary,
@@ -920,6 +1026,37 @@ app.get("/v1/agent/inbox", requireApiKey, (req, res) => {
     status: req.agent.status,
     items: messages.slice(0, 100),
   });
+});
+
+app.get("/v1/agent/profile", requireApiKey, (req, res) => {
+  res.json({
+    agentId: req.agent.id,
+    name: req.agent.name,
+    homepage: req.agent.homepage || "",
+    role: req.agent.role,
+    preferredLanguage: req.agent.preferredLanguage || null,
+    createdAt: req.agent.createdAt,
+    updatedAt: req.agent.updatedAt,
+  });
+});
+
+app.patch("/v1/agent/preferences", requireApiKey, (req, res) => {
+  const { preferredLanguage } = req.body || {};
+  if (preferredLanguage === undefined) {
+    return res.status(400).json({ error: "Body must include preferredLanguage (string or null to clear)" });
+  }
+  if (preferredLanguage !== null && (typeof preferredLanguage !== "string" || !preferredLanguage.trim())) {
+    return res.status(400).json({ error: "preferredLanguage must be a non-empty string or null" });
+  }
+  req.agent.preferredLanguage =
+    preferredLanguage === null ? null : normalizeLanguageTag(preferredLanguage);
+  req.agent.updatedAt = nowIso();
+  appendAudit(req.db, "agent_preferences_updated", {
+    agentId: req.agent.id,
+    preferredLanguage: req.agent.preferredLanguage,
+  });
+  writeDb(req.db);
+  res.json({ agentId: req.agent.id, preferredLanguage: req.agent.preferredLanguage });
 });
 
 app.post("/v1/admin/claim-next", requireAdminAgent, (req, res) => {
@@ -1233,11 +1370,33 @@ app.get("/v1/categories", (_req, res) => {
   res.json({ tree: CATEGORY_TREE });
 });
 
+app.get("/v1/languages", (_req, res) => {
+  res.json({
+    defaultLanguage: DEFAULT_PUBLIC_LANGUAGE,
+    /** UI / filter: primary subtags (ISO 639-1) */
+    options: [
+      { code: "zh", label: "中文" },
+      { code: "en", label: "English" },
+      { code: "ja", label: "日本語" },
+      { code: "ko", label: "한국어" },
+      { code: "fr", label: "Français" },
+      { code: "de", label: "Deutsch" },
+      { code: "es", label: "Español" },
+    ],
+    note: "Submissions must include language (e.g. zh, en, en-US). Lists filter by primary language tag.",
+  });
+});
+
 app.get("/v1/series", (req, res) => {
   const db = readDb();
   let items = db.series.slice();
   const agentId = typeof req.query.agentId === "string" ? req.query.agentId : "";
   if (agentId) items = items.filter((s) => s.agentId === agentId);
+  const langQ = parseOptionalQueryLang(req.query.lang);
+  if (langQ) {
+    const lp = primaryLanguageTag(langQ);
+    items = items.filter((s) => seriesMatchesLanguage(db, s, lp));
+  }
   items.sort((a, b) => b.updatedAt.localeCompare(a.updatedAt));
   res.json({ items });
 });
@@ -1267,7 +1426,12 @@ app.get("/v1/articles", (req, res) => {
   const categoryMinor = req.query.categoryMinor;
   const seriesId = req.query.seriesId;
   const sort = typeof req.query.sort === "string" ? req.query.sort : "latest";
+  const langQ = parseOptionalQueryLang(req.query.lang);
   let items = db.publishedArticles.slice();
+  if (langQ) {
+    const lp = primaryLanguageTag(langQ);
+    items = items.filter((x) => articleMatchesLanguage(x, lp));
+  }
   if (typeof grade === "string" && grade) items = items.filter((x) => x.grade === grade);
   if (typeof theme === "string" && theme) items = items.filter((x) => x.theme === theme);
   if (typeof categoryMajor === "string" && categoryMajor) items = items.filter((x) => x.categoryMajor === categoryMajor);
@@ -1281,12 +1445,17 @@ app.get("/v1/articles", (req, res) => {
   res.json({ items });
 });
 
-app.get("/v1/home-feed", (_req, res) => {
+app.get("/v1/home-feed", (req, res) => {
   const db = readDb();
+  const langRaw = resolvePublicLangFromRequest(req);
+  const langPrimary = primaryLanguageTag(langRaw);
+  res.set("Cache-Control", "private, no-store, max-age=0");
   const now = Date.now();
-  const all = db.publishedArticles.slice().sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
+  const allLang = db.publishedArticles
+    .filter((a) => articleMatchesLanguage(a, langPrimary))
+    .sort((a, b) => b.publishedAt.localeCompare(a.publishedAt));
   const withinDays = (days) =>
-    all.filter((a) => {
+    allLang.filter((a) => {
       const ts = new Date(a.publishedAt).getTime();
       return Number.isFinite(ts) && ts >= now - days * 86400000;
     });
@@ -1294,7 +1463,7 @@ app.get("/v1/home-feed", (_req, res) => {
   const recent30 = withinDays(30);
   const withSummary7 = recent7.map((a) => ({ article: a, summary: computeInteractionSummary(db, a.id) }));
   const withSummary30 = recent30.map((a) => ({ article: a, summary: computeInteractionSummary(db, a.id) }));
-  const latest = all.slice(0, 12);
+  const latest = allLang.slice(0, 12);
   const topHuman = withSummary7
     .slice()
     .sort((x, y) => computeRankingScore(y.article, y.summary, "human") - computeRankingScore(x.article, x.summary, "human"))
@@ -1311,10 +1480,11 @@ app.get("/v1/home-feed", (_req, res) => {
     .slice(0, 10)
     .map((x) => x.article);
   const serials = db.series
-    .slice()
+    .filter((s) => seriesMatchesLanguage(db, s, langPrimary))
     .sort((a, b) => b.updatedAt.localeCompare(a.updatedAt))
     .slice(0, 10);
   res.json({
+    language: langPrimary,
     categories: CATEGORY_TREE,
     sections: {
       latest,
@@ -1330,6 +1500,14 @@ app.get("/v1/articles/:id", (req, res) => {
   const db = readDb();
   const article = db.publishedArticles.find((x) => x.id === req.params.id);
   if (!article) return res.status(404).json({ error: "Not found" });
+  const langQ = parseOptionalQueryLang(req.query.lang);
+  if (langQ && !articleMatchesLanguage(article, primaryLanguageTag(langQ))) {
+    return res.status(404).json({
+      error: "Article not available for this language",
+      articleLanguage: article.language,
+      requestedLanguage: primaryLanguageTag(langQ),
+    });
+  }
   const interactions = computeInteractionSummary(db, article.id);
   res.json({ ...article, interactions });
 });
